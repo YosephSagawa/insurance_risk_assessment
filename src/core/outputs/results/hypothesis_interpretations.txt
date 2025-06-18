@@ -1,0 +1,22 @@
+Hypothesis: Claim Frequency by Province
+P-value: 0.0000
+Interpretation: Reject H0: Significant difference in claim frequency
+Cramer's V: 0.0102
+Business Insight: Adjust premiums by province due to varying claim frequencies.
+
+Hypothesis: Claim Frequency by Cresta Zone
+P-value: 0.0000
+Interpretation: Reject H0: Significant difference in claim frequency
+Cramer's V: 0.0133
+Warning: Low expected frequencies detected
+Business Insight: Adjust premiums by Cresta Zone due to varying claim frequencies.
+
+Hypothesis: Margin by Zipcode
+P-value: 0.1331
+Interpretation: Fail to reject H0: No significant difference
+
+Hypothesis: Claim Frequency by Gender
+P-value: 0.0303
+Interpretation: Reject H0: Significant difference in claim frequency
+Cramer's V: 0.0026
+

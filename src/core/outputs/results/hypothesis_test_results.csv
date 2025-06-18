@@ -1,0 +1,5 @@
+p_value,test_statistic,cramers_v,interpretation,hypothesis,warning
+5.925510718204678e-19,104.19088107029361,0.010206893325811723,Reject H0: Significant difference in claim frequency,Claim Frequency by Province,
+1.4389426030144278e-29,176.11901223090825,0.013270333615210692,Reject H0: Significant difference in claim frequency,Claim Frequency by Cresta Zone,Low expected frequencies detected
+0.13312324291625904,22654.5,,Fail to reject H0: No significant difference,Margin by Zipcode,
+0.030320141820186792,6.991886081544223,0.0026440879228671133,Reject H0: Significant difference in claim frequency,Claim Frequency by Gender,
