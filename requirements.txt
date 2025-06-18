@@ -7,3 +7,5 @@ scipy
 scikit-learn
 xgboost
 shap
+category_encoders
+imblearn

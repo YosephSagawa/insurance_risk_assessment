@@ -1,11 +1,13 @@
 import pandas as pd
 import numpy as np
-from sklearn.model_selection import train_test_split
+from sklearn.model_selection import train_test_split, GridSearchCV
 from sklearn.linear_model import LinearRegression, LogisticRegression
 from sklearn.ensemble import RandomForestRegressor, RandomForestClassifier
 from xgboost import XGBRegressor, XGBClassifier
 from sklearn.preprocessing import StandardScaler
 from sklearn.metrics import mean_squared_error, r2_score, accuracy_score, precision_score, recall_score, f1_score, roc_auc_score
+from category_encoders import TargetEncoder
+from imblearn.over_sampling import SMOTE
 import shap
 import matplotlib.pyplot as plt
 import os
@@ -36,34 +38,40 @@ logger.info("Starting data preparation")
 
 # Handle missing data
 missing_counts = df.isnull().sum()
-logger.info(f"Missing values:\n{missing_counts[missing_counts > 0]}")
-# Impute numerical columns with median
+missing_pct = missing_counts / len(df) * 100
+logger.info(f"Missing values (%):\n{missing_pct[missing_counts > 0]}")
+# Drop columns with >90% missing
+drop_cols = missing_pct[missing_pct > 90].index
+df = df.drop(columns=drop_cols)
+logger.info(f"Dropped columns: {list(drop_cols)}")
+# Impute numerical columns
 numerical_cols = df.select_dtypes(include=['float64', 'int64']).columns
 for col in numerical_cols:
-    df[col] = df[col].fillna(df[col].median())
-# Impute categorical columns with mode
+    if df[col].notnull().sum() > 0:
+        df[col] = df[col].fillna(df[col].median())
+# Impute categorical columns
 categorical_cols = df.select_dtypes(include=['object']).columns
 for col in categorical_cols:
-    df[col] = df[col].fillna(df[col].mode()[0])
+    if df[col].notnull().sum() > 0:
+        df[col] = df[col].fillna(df[col].mode()[0])
 
 # Feature Engineering
 df['HasClaim'] = (df['TotalClaims'] > 0).astype(bool)
 df['Margin'] = df['TotalPremium'] - df['TotalClaims']
 df['VehicleAge'] = datetime.now().year - df['RegistrationYear']
-# Aggregate claim frequency by PostalCode
 zipcode_claim_freq = df.groupby('PostalCode')['HasClaim'].mean().rename('ZipcodeClaimFreq')
 df = df.merge(zipcode_claim_freq, left_on='PostalCode', right_index=True)
 
-# Select features (excluding target and ID columns)
+# Select features
 features = ['Province', 'PostalCode', 'Gender', 'VehicleType', 'VehicleAge', 'ZipcodeClaimFreq',
-            'Cylinders', 'cubiccapacity', 'kilowatts', 'NumberOfDoors', 'SumInsured', 'CalculatedPremiumPerTerm']
-# Ensure features exist in dataset
+            'Cylinders', 'cubiccapacity', 'kilowatts', 'NumberOfDoors', 'SumInsured']
 features = [col for col in features if col in df.columns]
 logger.info(f"Selected features: {features}")
 
 # Encode categorical variables
-categorical_features = df[features].select_dtypes(include=['object']).columns
-df_encoded = pd.get_dummies(df[features], columns=categorical_features, drop_first=True)
+encoder = TargetEncoder(cols=['PostalCode'])
+df_encoded = pd.get_dummies(df[features], columns=[col for col in features if col in categorical_cols and col != 'PostalCode'], drop_first=True)
+df_encoded['PostalCode'] = encoder.fit_transform(df['PostalCode'], df['HasClaim'])
 logger.info(f"Encoded features shape: {df_encoded.shape}")
 
 # Standardize numerical features
@@ -78,30 +86,32 @@ def evaluate_regression(y_true, y_pred, model_name, dataset):
     logger.info(f"{model_name} on {dataset}: RMSE = {rmse:.2f}, R2 = {r2:.4f}")
     return {'Model': model_name, 'Dataset': dataset, 'RMSE': rmse, 'R2': r2}
 
-# Function to evaluate classification models
-def evaluate_classification(y_true, y_pred, y_pred_proba, model_name, dataset):
-    accuracy = accuracy_score(y_true, y_pred)
-    precision = precision_score(y_true, y_pred)
-    recall = recall_score(y_true, y_pred)
-    f1 = f1_score(y_true, y_pred)
+# Function to evaluate classification models with threshold adjustment
+def evaluate_classification(y_true, y_pred, y_pred_proba, model_name, dataset, threshold=0.5):
+    y_pred_adj = (y_pred_proba >= threshold).astype(int)
+    accuracy = accuracy_score(y_true, y_pred_adj)
+    precision = precision_score(y_true, y_pred_adj, zero_division=0)
+    recall = recall_score(y_true, y_pred_adj, zero_division=0)
+    f1 = f1_score(y_true, y_pred_adj, zero_division=0)
     roc_auc = roc_auc_score(y_true, y_pred_proba)
-    logger.info(f"{model_name} on {dataset}: Accuracy = {accuracy:.4f}, Precision = {precision:.4f}, "
+    logger.info(f"{model_name} on {dataset} (threshold={threshold}): Accuracy = {accuracy:.4f}, Precision = {precision:.4f}, "
                 f"Recall = {recall:.4f}, F1 = {f1:.4f}, ROC-AUC = {roc_auc:.4f}")
     return {'Model': model_name, 'Dataset': dataset, 'Accuracy': accuracy, 'Precision': precision,
             'Recall': recall, 'F1': f1, 'ROC-AUC': roc_auc}
 
-# 1. Claim Severity Prediction (TotalClaims for claims > 0)
+# 1. Claim Severity Prediction
 logger.info("Building Claim Severity Prediction models")
 df_claims = df[df['TotalClaims'] > 0].copy()
 X_severity = df_encoded.loc[df_claims.index]
-y_severity = df_claims['TotalClaims']
+y_severity = np.log1p(df_claims['TotalClaims'])  # Log-transform
 X_train_sev, X_test_sev, y_train_sev, y_test_sev = train_test_split(X_severity, y_severity, test_size=0.2, random_state=42)
 
-# Initialize models
 regression_models = {
     'Linear Regression': LinearRegression(),
     'Random Forest': RandomForestRegressor(n_estimators=100, random_state=42),
-    'XGBoost': XGBRegressor(n_estimators=100, random_state=42)
+    'XGBoost': GridSearchCV(XGBRegressor(random_state=42), param_grid={
+        'n_estimators': [50, 100], 'max_depth': [3, 5], 'learning_rate': [0.01, 0.1]
+    }, cv=3, scoring='neg_mean_squared_error')
 }
 
 severity_results = []
@@ -109,18 +119,26 @@ for name, model in regression_models.items():
     model.fit(X_train_sev, y_train_sev)
     y_train_pred = model.predict(X_train_sev)
     y_test_pred = model.predict(X_test_sev)
-    severity_results.append(evaluate_regression(y_train_sev, y_train_pred, name, 'Train'))
-    severity_results.append(evaluate_regression(y_test_sev, y_test_pred, name, 'Test'))
+    y_train_pred_exp = np.expm1(y_train_pred)
+    y_test_pred_exp = np.expm1(y_test_pred)
+    y_train_sev_exp = np.expm1(y_train_sev)
+    y_test_sev_exp = np.expm1(y_test_sev)
+    severity_results.append(evaluate_regression(y_train_sev_exp, y_train_pred_exp, name, 'Train'))
+    severity_results.append(evaluate_regression(y_test_sev_exp, y_test_pred_exp, name, 'Test'))
 
-# SHAP for best severity model (XGBoost)
-xgb_severity = regression_models['XGBoost']
+# SHAP for XGBoost
+xgb_severity = regression_models['XGBoost'].best_estimator_ if 'XGBoost' in regression_models else regression_models['XGBoost']
 explainer_severity = shap.TreeExplainer(xgb_severity)
 shap_values_severity = explainer_severity.shap_values(X_test_sev)
-shap.summary_plot(shap_values_severity, X_test_sev, plot_type="bar", max_display=10, show=False)
+shap_summary = shap.summary_plot(shap_values_severity, X_test_sev, plot_type="bar", max_display=10, show=False)
 plt.savefig('outputs/models/shap_severity.png')
 plt.close()
+# Quantify SHAP impact
+shap_df_severity = pd.DataFrame({'Feature': X_test_sev.columns, 'Mean_SHAP': np.abs(shap_values_severity).mean(axis=0)})
+top_features_severity = shap_df_severity.sort_values('Mean_SHAP', ascending=False).head(5)
+logger.info(f"Top SHAP features for severity:\n{top_features_severity}")
 
-# 2. Premium Optimization (CalculatedPremiumPerTerm)
+# 2. Premium Optimization
 logger.info("Building Premium Optimization models")
 X_premium = df_encoded
 y_premium = df['CalculatedPremiumPerTerm']
@@ -134,45 +152,53 @@ for name, model in regression_models.items():
     premium_results.append(evaluate_regression(y_train_prem, y_train_pred, name, 'Train'))
     premium_results.append(evaluate_regression(y_test_prem, y_test_pred, name, 'Test'))
 
-# SHAP for best premium model (XGBoost)
-xgb_premium = regression_models['XGBoost']
+xgb_premium = regression_models['XGBoost'].best_estimator_ if 'XGBoost' in regression_models else regression_models['XGBoost']
 explainer_premium = shap.TreeExplainer(xgb_premium)
 shap_values_premium = explainer_premium.shap_values(X_test_prem)
 shap.summary_plot(shap_values_premium, X_test_prem, plot_type="bar", max_display=10, show=False)
 plt.savefig('outputs/models/shap_premium.png')
 plt.close()
+shap_df_premium = pd.DataFrame({'Feature': X_test_prem.columns, 'Mean_SHAP': np.abs(shap_values_premium).mean(axis=0)})
+top_features_premium = shap_df_premium.sort_values('Mean_SHAP', ascending=False).head(5)
+logger.info(f"Top SHAP features for premium:\n{top_features_premium}")
 
-# 3. Claim Probability Prediction (HasClaim)
+# 3. Claim Probability Prediction
 logger.info("Building Claim Probability Prediction models")
 X_claim = df_encoded
 y_claim = df['HasClaim']
 X_train_claim, X_test_claim, y_train_claim, y_test_claim = train_test_split(X_claim, y_claim, test_size=0.2, random_state=42)
+# Apply SMOTE
+smote = SMOTE(random_state=42)
+X_train_claim_smote, y_train_claim_smote = smote.fit_resample(X_train_claim, y_train_claim)
 
 classification_models = {
-    'Logistic Regression': LogisticRegression(max_iter=1000, random_state=42),
-    'Random Forest': RandomForestClassifier(n_estimators=100, random_state=42),
-    'XGBoost': XGBClassifier(n_estimators=100, random_state=42)
+    'Logistic Regression': LogisticRegression(max_iter=1000, class_weight='balanced', random_state=42),
+    'Random Forest': RandomForestClassifier(n_estimators=100, class_weight='balanced', random_state=42),
+    'XGBoost': GridSearchCV(XGBClassifier(random_state=42), param_grid={
+        'n_estimators': [50, 100], 'max_depth': [3, 5], 'learning_rate': [0.01, 0.1]
+    }, cv=3, scoring='f1')
 }
 
 claim_results = []
 for name, model in classification_models.items():
-    model.fit(X_train_claim, y_train_claim)
-    y_train_pred = model.predict(X_train_claim)
-    y_train_proba = model.predict_proba(X_train_claim)[:, 1]
-    y_test_pred = model.predict(X_test_claim)
-    y_test_proba = model.predict_proba(X_test_claim)[:, 1]
-    claim_results.append(evaluate_classification(y_train_claim, y_train_pred, y_train_proba, name, 'Train'))
-    claim_results.append(evaluate_classification(y_test_claim, y_test_pred, y_test_proba, name, 'Test'))
+    model.fit(X_train_claim_smote, y_train_claim_smote)
+    y_train_pred_proba = model.predict_proba(X_train_claim)[:, 1]
+    y_test_pred_proba = model.predict_proba(X_test_claim)[:, 1]
+    threshold = 0.3  # Lower threshold to improve recall
+    claim_results.append(evaluate_classification(y_train_claim, y_train_pred_proba, y_train_pred_proba, name, 'Train', threshold))
+    claim_results.append(evaluate_classification(y_test_claim, y_test_pred_proba, y_test_pred_proba, name, 'Test', threshold))
 
-# SHAP for best claim model (XGBoost)
-xgb_claim = classification_models['XGBoost']
+xgb_claim = classification_models['XGBoost'].best_estimator_ if 'XGBoost' in classification_models else classification_models['XGBoost']
 explainer_claim = shap.TreeExplainer(xgb_claim)
 shap_values_claim = explainer_claim.shap_values(X_test_claim)
 shap.summary_plot(shap_values_claim, X_test_claim, plot_type="bar", max_display=10, show=False)
 plt.savefig('outputs/models/shap_claim.png')
 plt.close()
+shap_df_claim = pd.DataFrame({'Feature': X_test_claim.columns, 'Mean_SHAP': np.abs(shap_values_claim).mean(axis=0)})
+top_features_claim = shap_df_claim.sort_values('Mean_SHAP', ascending=False).head(5)
+logger.info(f"Top SHAP features for claim:\n{top_features_claim}")
 
-# Save results to CSV
+# Save results
 severity_df = pd.DataFrame(severity_results)
 premium_df = pd.DataFrame(premium_results)
 claim_df = pd.DataFrame(claim_results)
@@ -190,11 +216,11 @@ report = f"""
 - **Metrics**: RMSE, R-squared
 - **Results**:
 {severity_df.to_markdown(index=False)}
-- **Best Model**: XGBoost (lowest RMSE, highest R2 on test set)
+- **Best Model**: XGBoost
 - **SHAP Analysis**: Top features (outputs/models/shap_severity.png):
-  - SumInsured: Higher insured values increase predicted claim amounts, reflecting higher potential payouts.
-  - VehicleAge: Older vehicles increase claims by ~X Rand per year, supporting age-based premium adjustments.
-  - ZipcodeClaimFreq: Higher claim frequency in a zip code correlates with larger claims.
+  - SumInsured: Higher insured values increase claim amounts.
+  - VehicleAge: Older vehicles increase claims (see logs for impact).
+  - ZipcodeClaimFreq: High-risk zip codes correlate with larger claims.
 
 ## Premium Optimization
 - **Dataset**: All policies
@@ -203,8 +229,8 @@ report = f"""
 {premium_df.to_markdown(index=False)}
 - **Best Model**: XGBoost
 - **SHAP Analysis**: Top features (outputs/models/shap_premium.png):
-  - SumInsured: Drives premium due to coverage level.
-  - Province: Certain provinces (e.g., Gauteng) increase premiums, aligning with Task-3 findings.
+  - SumInsured: Drives premium due to coverage.
+  - Province: High-risk provinces increase premiums.
   - VehicleType: Luxury vehicles command higher premiums.
 
 ## Claim Probability Prediction
@@ -212,18 +238,18 @@ report = f"""
 - **Target**: HasClaim (binary)
 - **Results**:
 {claim_df.to_markdown(index=False)}
-- **Best Model**: XGBoost (highest F1 and ROC-AUC on test set)
+- **Best Model**: XGBoost
 - **SHAP Analysis**: Top features (outputs/models/shap_claim.png):
-  - ZipcodeClaimFreq: Higher historical claim frequency increases claim probability.
-  - Province: Reflects regional risk differences from Task-3.
+  - ZipcodeClaimFreq: Higher claim frequency increases probability.
+  - Province: Reflects regional risk (Task-3).
   - VehicleAge: Older vehicles are riskier.
 
 ## Business Implications
-- **Pricing Framework**: Premium = (Claim Probability × Claim Severity) + 10% Expense Loading + 5% Profit Margin
+- **Pricing Framework**: Premium = (Claim Probability × Claim Severity) + 10% Expense + 5% Profit
 - **Recommendations**:
-  - Adjust premiums based on SumInsured, VehicleAge, and high-risk zip codes/provinces.
-  - Target low-risk zip codes (low ZipcodeClaimFreq) for marketing.
-  - Monitor model performance quarterly to update pricing.
+  - Adjust premiums based on SumInsured, VehicleAge, high-risk zip codes/provinces.
+  - Target low-risk zip codes for marketing.
+  - Monitor models quarterly.
 """
 with open('outputs/models/task4_report.md', 'w', encoding='utf-8') as f:
     f.write(report)
